@@ -123,31 +123,84 @@ function replace_static_vars(ast) {
 }
 
 function replace_arr_calls(ast) {
+  if (!ast) throw new Error("replace_arr_calls: ast is required");
+
   function get_arr(name) {
+    if (!name || typeof name !== "string") return undefined;
+
     let arr;
     traverse(ast, {
       FunctionDeclaration(path) {
-        if (!path.node.id || path.node.id.name != name) return;
-        arr = eval(generate(path.node.body.body[0].declarations[0].init).code);
+        if (!path.node.id || path.node.id.name !== name) return;
+
+        const body = path.node.body?.body;
+        if (!body || body.length === 0) return;
+
+        const declaration = body[0]?.declarations?.[0]?.init;
+        if (!declaration) return;
+
+        try {
+          const code = generate(declaration).code;
+          arr = eval(code);
+        } catch (e) { }
       },
     });
+
     return arr;
   }
+
   traverse(ast, {
     FunctionDeclaration(path) {
-      if (path.getFunctionParent().getFunctionParent()) return;
-      if (path.node.body.body.length != 1) return;
-      const arg = path.node.body.body[0].argument;
-      if (!arg) return;
-      if (arg.type != "MemberExpression") return;
-      if (!arg.object || arg.object.type != "CallExpression") return;
+      if (path.getFunctionParent()?.getFunctionParent?.()) return;
 
-      const arr = get_arr(arg.object.callee.name);
-      for (const reference of path.scope.getBinding(path.node.id.name).referencePaths) {
-        reference.parentPath.replaceWith(t.stringLiteral(arr[reference.parentPath.node.arguments[0].value]));
+      const body = path.node.body?.body;
+      if (!body || body.length !== 1) return;
+
+      const arg = body[0]?.argument;
+      if (!arg) return;
+
+      if (arg.type !== "MemberExpression") return;
+
+      const callExpr = arg.object;
+      if (!callExpr || callExpr.type !== "CallExpression") return;
+
+      const calleeName = callExpr.callee?.name;
+      if (!calleeName) return;
+
+      const arr = get_arr(calleeName);
+      if (!Array.isArray(arr)) return;
+
+      const funcName = path.node.id?.name;
+      if (!funcName) return;
+
+      const binding = path.scope.getBinding(funcName);
+      if (!binding) return;
+
+      for (const reference of binding.referencePaths) {
+        const parentNode = reference.parentPath?.node;
+        if (!parentNode) continue;
+
+        if (parentNode.type !== "CallExpression") continue;
+
+        const args = parentNode.arguments;
+        if (!args || args.length === 0) continue;
+
+        const indexArg = args[0];
+        if (indexArg?.type !== "NumericLiteral") continue;
+
+        const index = indexArg.value;
+        if (index < 0 || index >= arr.length) continue;
+
+        if (typeof arr[index] !== "string") continue;
+
+        try {
+          reference.parentPath.replaceWith(t.stringLiteral(arr[index]));
+        } catch (e) { }
       }
 
-      path.remove();
+      try {
+        path.remove();
+      } catch (e) { }
     },
   });
 }
@@ -822,7 +875,7 @@ function deobfuscate(filePath) {
     const st = get_push_target(ast);
     replace_functions_with_string(ast, replaced, ctx, st);
 
-  } catch (e){
+  } catch (e) {
     console.log("[error] Invalid/Unsupported Akamai JS file.: ", e)
     return null;
   }
