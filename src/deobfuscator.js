@@ -810,6 +810,7 @@ function replace_functions_with_string(ast, functions, context, stack_var) {
 
   vm.runInContext(`var ${stack_var} = [];`, context);
 
+  let replaced = 0;
   traverse(ast, {
     CallExpression(path) {
       if (path.node.callee.type !== "Identifier") return;
@@ -824,10 +825,14 @@ function replace_functions_with_string(ast, functions, context, stack_var) {
 
       try {
         const str = vm.runInContext(function_call, context);
-        if (isPrintableASCII(str)) path.replaceWith(t.stringLiteral(str));
+        if (typeof str === "string" && isPrintableASCII(str)) {
+          path.replaceWith(t.stringLiteral(str));
+          replaced++;
+        }
       } catch { }
     }
   });
+  console.log(`[string_replacement] done → ${replaced} call site(s) decoded`);
 }
 
 function get_push_target(ast) {
