@@ -483,33 +483,34 @@ function replace_function_calls(ast) {
     if (replacement_cache.has(cache_key)) return replacement_cache.get(cache_key);
 
     let t_case_path;
-    traverse(ast, {
 
+    function find_dispatch_case(bodyPaths) {
+      for (const stmtPath of bodyPaths) {
+        const node = stmtPath.node;
+        if (!t.isIfStatement(node)) continue;
+        const test = node.test;
+        if (!t.isBinaryExpression(test)) continue;
+        if (test.operator !== "===" && test.operator !== "==") continue;
+        if (!t.isIdentifier(test.left)) continue;
+        if (!t.isNumericLiteral(test.right)) continue;
+        if (test.right.value !== t_case) continue;
+        return stmtPath;
+      }
+      return null;
+    }
+
+    traverse(ast, {
       FunctionDeclaration(path) {
         if (path.node.id?.name !== f_name) return;
-        path.traverse({
-          IfStatement(casePath) {
-            if (!casePath.node.test) return;
-            const caseValue = casePath.node.test.right.value;
-            if (caseValue !== t_case) return;
-            t_case_path = casePath;
-            casePath.stop();
-          },
-        });
+        t_case_path = find_dispatch_case(path.get("body.body"));
         if (t_case_path) path.stop();
       },
       VariableDeclaration(path) {
         const decl = path.node.declarations[0];
         if (decl?.id?.name !== f_name) return;
-        path.traverse({
-          IfStatement(casePath) {
-            if (!casePath.node.test) return;
-            const caseValue = casePath.node.test.right.value;
-            if (caseValue !== t_case) return;
-            t_case_path = casePath;
-            casePath.stop();
-          },
-        });
+        const initPath = path.get("declarations.0.init");
+        if (!initPath.isFunctionExpression() && !initPath.isFunctionDeclaration()) return;
+        t_case_path = find_dispatch_case(initPath.get("body.body"));
         if (t_case_path) path.stop();
       },
     });
@@ -770,7 +771,10 @@ function replace_function_calls(ast) {
     },
   });
 
-  return Array.from(new Set(replaced_fns));
+  const re = Array.from(new Set(replaced_fns));
+  console.log("[function_replacement] replaced", re);
+
+  return re;
 }
 
 function replace_functions_with_string(ast, functions, context, stack_var) {

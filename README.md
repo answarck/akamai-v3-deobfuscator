@@ -4,6 +4,12 @@ This repository contains script for deobfuscating Akamai Sensor v3 JavaScript. T
 
 ---
 
+## Disclaimer
+
+This project is provided for **educational and research purposes only**.  The author accepts no responsibility for any misuse of this code. Use it at your own risk.
+
+---
+
 ## Install dependencies
 
 ```bash
