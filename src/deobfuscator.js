@@ -5,7 +5,7 @@ import * as t from "@babel/types";
 import fs from "fs";
 import vm from "vm";
 
-import createObfuscatedContext from "./context_setup.js";
+import createObfuscatedContext, { createFunctionContext, findSensorFunction } from "./context_setup.js";
 
 const traverse = traverseModule.default;
 const generate = generator.default;
@@ -252,6 +252,31 @@ function flatten(ast) {
       const binding = parent.scope.getBinding(index.name);
       if (!binding) return;
 
+      // Only a switch that dispatches on the function's first parameter is a
+      // control-flow-flattening dispatcher. Anything else — e.g. the
+      // `while (1) switch (gen.state = gen.next) {…}` generator-step loops the
+      // sensor uses for its async code — must be left untouched.
+      const disc = path.node.discriminant;
+      const dispatchesOnIndex =
+        t.isIdentifier(disc, { name: index.name }) ||
+        (t.isBinaryExpression(disc) &&
+          [disc.left, disc.right].some(n => t.isIdentifier(n, { name: index.name })));
+      if (!dispatchesOnIndex) return;
+
+      // A call site only counts when its callee resolves to *this* function.
+      // Identifiers are reused across scopes (the nested VM has its own `TV`
+      // next to the outer `TV`), so matching by name alone would collect the
+      // other function's case values and then find no matching case here.
+      const refersToThisFunction = (callPath, name) => {
+        const b = callPath.scope.getBinding(name);
+        if (!b) return false;
+        if (b.path.node === parent.node) return true;
+        if (b.path.isVariableDeclarator() && b.path.node.init === parent.node) return true;
+        return b.constantViolations.some(
+          v => v.isAssignmentExpression() && v.node.right === parent.node
+        );
+      };
+
       const fnNames = new Set();
       if (parent.node.id?.name) fnNames.add(parent.node.id.name);
       if (t.isVariableDeclarator(parent.parent)) {
@@ -288,6 +313,7 @@ function flatten(ast) {
           }
 
           if (!fnNames.has(targetName)) return;
+          if (!refersToThisFunction(callPath, targetName)) return;
 
           const args = callPath.node.arguments;
           if (isAppliedOrCalled) {
@@ -392,10 +418,11 @@ function flatten(ast) {
         }
       }
 
-      if (ifBlocks.length === 0) {
-        path.remove();
-        return;
-      }
+      // Nothing could be reconstructed (the call sites use values this switch
+      // has no case for). Leave the original switch in place: deleting it
+      // silently turns the function into a no-op, or — when the switch sits
+      // inside a `while (1)` — into an infinite loop that freezes the page.
+      if (ifBlocks.length === 0) return;
 
       const ifStatements = ifBlocks.map(({ test, stmts }) =>
         t.ifStatement(
@@ -773,66 +800,363 @@ function replace_function_calls(ast) {
   return Array.from(new Set(replaced_fns));
 }
 
+// Decoder call sites come in two shapes, depending on the build:
+//
+//   1. a plain call to a top-level decoder: `qtj(123, 45)`. These names are
+//      the ones `replace_function_calls` inlined (`functions`).
+//   2. a memoised method on a cache object, installed at runtime by loops like
+//
+//        for (...) E[names[i]] = function () {
+//          var k = names[i];
+//          return function (a, b) { var s = decode(a, b); E[k] = function () { return s; }; return s; };
+//        }();
+//
+//      and called as `E.N9(19, 10, 1122, 8)`, `E.Zm.call(null, 1400, 97, 31)`
+//      or `E.q.apply(null, [1051, 21, 6, 23, 80, 57])`. The first call wins and
+//      every later call returns the memoised string, so each key is one string.
+//
+// Every decoder reads the top of the sensor's scope stack (`UD[UD.length - 1]`)
+// to offset its table index, so a call is only evaluated after replaying the
+// `UD.push(n)` of the enclosing function. The cache objects are restored from
+// a snapshot before each evaluation so one mis-evaluated site cannot poison a
+// key for every later site through the memoisation.
 function replace_functions_with_string(ast, functions, context, stack_var) {
   console.log("[string_replacement] This may take some time");
   function isPrintableASCII(str) {
     for (let i = 0; i < str.length; i++) {
       const c = str.charCodeAt(i);
+      if (c === 0x09 || c === 0x0A || c === 0x0D) continue;
       if (c < 0x20 || c > 0x7E) return false;
     }
     return true;
   }
-  function get_stack_push(path) {
-    const funcParent = path.getFunctionParent();
-    if (!funcParent) return null;
-    let result = null;
-    funcParent.traverse({
-      CallExpression(innerPath) {
-        if (innerPath.getFunctionParent() !== funcParent) return;
-        if (innerPath.node === path.node) {
-          innerPath.stop();
-          return;
-        }
-        const callee = innerPath.node.callee;
-        if (
-          callee.type === "MemberExpression" &&
-          callee.object.type === "Identifier" &&
-          callee.object.name === stack_var &&
-          callee.property.type === "Identifier" &&
-          callee.property.name === "push"
-        ) {
-          result = innerPath;
-        }
-      }
-    });
-    return result;
+
+  // An argument the decoded value cannot depend on at runtime: literals and
+  // the obfuscator's boolean spellings (`!![]`, `!{}`, `!1`).
+  function isStaticArg(node) {
+    if (!node) return false;
+    if (t.isNumericLiteral(node) || t.isStringLiteral(node) || t.isBooleanLiteral(node) || t.isNullLiteral(node)) return true;
+    if (t.isUnaryExpression(node)) return isStaticArg(node.argument);
+    if (t.isArrayExpression(node)) return node.elements.every(isStaticArg);
+    if (t.isObjectExpression(node)) return node.properties.length === 0;
+    return false;
   }
 
-  vm.runInContext(`var ${stack_var} = [];`, context);
+  // Objects that receive memoised decoders: `X[...] = <expr>` where <expr>
+  // itself re-assigns a member of X to a function (the memoisation step).
+  function find_cache_objects(ast) {
+    const names = new Map();
+    traverse(ast, {
+      AssignmentExpression(path) {
+        const { left, right } = path.node;
+        if (!t.isMemberExpression(left) || !t.isIdentifier(left.object)) return;
+        if (!t.isFunctionExpression(right) && !t.isCallExpression(right)) return;
+        const obj = left.object.name;
+        let memoises = false;
+        path.get("right").traverse({
+          AssignmentExpression(inner) {
+            const l = inner.node.left;
+            if (t.isMemberExpression(l) && t.isIdentifier(l.object, { name: obj }) && t.isFunction(inner.node.right)) {
+              memoises = true;
+              inner.stop();
+            }
+          },
+        });
+        if (memoises) names.set(obj, (names.get(obj) ?? 0) + 1);
+      },
+    });
+    return names;
+  }
+
+  const cache_objects = find_cache_objects(ast);
+  if (cache_objects.size > 0) {
+    const desc = [...cache_objects].map(([n, c]) => `${n} (${c} installer${c === 1 ? "" : "s"})`).join(", ");
+    console.log(`[string_replacement] memoised decoder cache object(s): ${desc}`);
+  }
+
+  // Is this call a decoder call we can evaluate statically?
+  function is_decoder_call(node) {
+    const callee = node.callee;
+    if (t.isIdentifier(callee)) return functions.includes(callee.name);
+    if (!t.isMemberExpression(callee)) return false;
+
+    let member = callee;
+    let args = node.arguments;
+    if (
+      !callee.computed &&
+      t.isIdentifier(callee.property) &&
+      (callee.property.name === "call" || callee.property.name === "apply") &&
+      t.isMemberExpression(callee.object)
+    ) {
+      member = callee.object;
+      const [thisArg, ...rest] = node.arguments;
+      if (thisArg && !isStaticArg(thisArg)) return false;
+      if (callee.property.name === "call") {
+        args = rest;
+      } else {
+        if (rest.length > 1) return false;
+        if (rest.length === 1 && !t.isArrayExpression(rest[0])) return false;
+        args = rest.length ? rest[0].elements : [];
+      }
+    }
+
+    if (!t.isIdentifier(member.object) || !cache_objects.has(member.object.name)) return false;
+    const keyIsStatic = member.computed ? t.isStringLiteral(member.property) : t.isIdentifier(member.property);
+    if (!keyIsStatic) return false;
+    return args.every(isStaticArg);
+  }
+
+  // The `UD.push(n)` that precedes `path` in the nearest enclosing function
+  // that has one. Nested callbacks without a push of their own run with the
+  // enclosing function's frame on top of the stack.
+  function get_stack_push(path) {
+    for (let fn = path.getFunctionParent(); fn; fn = fn.getFunctionParent()) {
+      let result = null;
+      fn.traverse({
+        enter(inner) {
+          if (inner.node === path.node) {
+            inner.stop();
+            return;
+          }
+          if (!inner.isCallExpression() || inner.getFunctionParent() !== fn) return;
+          const callee = inner.node.callee;
+          if (
+            t.isMemberExpression(callee) &&
+            t.isIdentifier(callee.object, { name: stack_var }) &&
+            t.isIdentifier(callee.property, { name: "push" })
+          ) {
+            result = inner;
+          }
+        },
+      });
+      if (result) return result;
+    }
+    return null;
+  }
+
+  if (stack_var) {
+    vm.runInContext(
+      `if (typeof ${stack_var} === "undefined" || !Array.isArray(${stack_var})) ${stack_var} = [];`,
+      context
+    );
+  }
+
+  // Snapshot the cache objects so each site is decoded from a clean memo state.
+  const snapshot = "__deob_cache_snapshot__";
+  const objs = [...cache_objects.keys()];
+  vm.runInContext(
+    `var ${snapshot} = {};` +
+      objs.map((o) => `try { ${snapshot}[${JSON.stringify(o)}] = Object.assign({}, ${o}); } catch (e) {}`).join(""),
+    context
+  );
+  const restore = objs
+    .map((o) => `try { Object.assign(${o}, ${snapshot}[${JSON.stringify(o)}]); } catch (e) {}`)
+    .join("");
 
   let replaced = 0;
+  let unevaluated = 0;
   traverse(ast, {
     CallExpression(path) {
-      if (path.node.callee.type !== "Identifier") return;
-      if (!functions.includes(path.node.callee.name)) return;
+      if (!is_decoder_call(path.node)) return;
+      if (path.parentPath.isExpressionStatement()) return;
 
-      const function_call = generate(path.node).code;
-      const stack_push = get_stack_push(path);
-      if (!stack_push) return;
+      // Replay the enclosing `UD.push(n)` around the call; a build with no
+      // scope stack is evaluated as is.
+      let frame = "";
+      if (stack_var) {
+        const stack_push = get_stack_push(path);
+        if (!stack_push) {
+          unevaluated++;
+          return;
+        }
+        frame = `var __depth = ${stack_var}.length; ${generate(stack_push.node).code}; `;
+      }
 
-      const stack_push_code = generate(stack_push.node).code;
-      vm.runInContext(stack_push_code, context);
+      const code =
+        `(function () { ${restore}${frame}` +
+        `try { return (${generate(path.node).code}); }` +
+        `finally { ${stack_var ? `${stack_var}.length = __depth;` : ""} } })()`;
 
       try {
-        const str = vm.runInContext(function_call, context);
+        const str = vm.runInContext(code, context, { timeout: 2000 });
         if (typeof str === "string" && isPrintableASCII(str)) {
           path.replaceWith(t.stringLiteral(str));
           replaced++;
+        } else {
+          unevaluated++;
         }
-      } catch { }
-    }
+      } catch {
+        unevaluated++;
+      }
+    },
   });
-  console.log(`[string_replacement] done → ${replaced} call site(s) decoded`);
+  console.log(`[string_replacement] done → ${replaced} call site(s) decoded, ${unevaluated} left as is`);
+}
+
+// Akamai guards its string tables with a self-integrity key. Both the sensor
+// IIFE and the embedded `QS` VM contain a memoised getter of the form
+//
+//   function QL() { var k; k = G8B() - GGB(); return QL = function () { return k; }, k; }
+//
+// where G8B() reads a marker constant embedded in the enclosing function's own
+// source (`0xad59bc2, 4241118000;`, located through `Function.prototype
+// .toString`) and GGB() is a hash of that same source. Every string decoder
+// mixes the key into its table index. Any rewrite of the function — even
+// Babel re-printing `'\x76'` as `"v"` — changes the hash, so the key is off
+// and every name the VM decodes is garbage (`XnB.v is not a function`).
+//
+// We cannot keep the printed text byte-identical, so instead each key is
+// evaluated in a context built from the *original* function text and pinned
+// to that constant. Keys are found generically rather than by name:
+//   1. a function that stores a reference to itself (`holder()[k] = <ownName>`),
+//   2. the member functions that stringify that reference,
+//   3. everything that (transitively) calls them,
+//   4. and among those, the zero-argument memoised getters returning a primitive.
+function pin_self_hash_keys(ast, source, sensorCtx) {
+  console.log("[self_hash] Pinning source-hash keys");
+  const originalAst = parser.parse(source);
+  const sensorName = findSensorFunction(originalAst)?.id?.name;
+  const escapeRe = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  // Same-named function in the untouched source, so the context sees the
+  // byte-exact text the hash was computed over.
+  function findOriginal(name, paramCount) {
+    let found = null;
+    traverse(originalAst, {
+      "FunctionDeclaration|FunctionExpression"(p) {
+        if (p.node.id?.name !== name || p.node.params.length !== paramCount) return;
+        if (!found || p.node.end - p.node.start > found.end - found.start) found = p.node;
+      },
+    });
+    return found;
+  }
+
+  function toLiteral(value) {
+    if (typeof value === "number") {
+      return value < 0
+        ? t.unaryExpression("-", t.numericLiteral(-value))
+        : t.numericLiteral(value);
+    }
+    if (typeof value === "boolean") return t.booleanLiteral(value);
+    return t.stringLiteral(value);
+  }
+
+  let pinned = 0;
+  traverse(ast, {
+    "FunctionDeclaration|FunctionExpression"(fnPath) {
+      const fnName = fnPath.node.id?.name;
+      if (!fnName) return;
+
+      // 1. The self-reference store: `<member> = <ownName>` resolving to this function.
+      let selfExpr = null;
+      fnPath.traverse({
+        AssignmentExpression(p) {
+          if (selfExpr) return;
+          const { left, right } = p.node;
+          if (!t.isIdentifier(right, { name: fnName }) || !t.isMemberExpression(left)) return;
+          const b = p.scope.getBinding(fnName);
+          if (!b || b.path.node !== fnPath.node) return;
+          selfExpr = generate(left).code;
+        },
+      });
+      if (!selfExpr) return;
+
+      // Member functions: top-level `function f(){}` and `var f = function(){}`.
+      const members = new Map();
+      for (const stmt of fnPath.get("body.body")) {
+        if (stmt.isFunctionDeclaration() && stmt.node.id) {
+          members.set(stmt.node.id.name, stmt);
+        } else if (stmt.isVariableDeclaration()) {
+          for (const d of stmt.get("declarations")) {
+            if (t.isIdentifier(d.node.id) && t.isFunction(d.node.init)) members.set(d.node.id.name, d.get("init"));
+          }
+        }
+      }
+      const codeOf = new Map([...members].map(([n, p]) => [n, generate(p.node).code]));
+
+      // 2. Readers: `${ref}`, `ref + ""`, `"" + ref`, `ref.name`, `ref.toString()`, `String(ref)`
+      //    (the reference may be stored behind a getter, hence the optional `()`).
+      const e = escapeRe(selfExpr);
+      const readerRe = new RegExp(
+        `\\$\\{\\s*${e}(\\(\\))?\\s*\\}` +
+        `|${e}(\\(\\))?\\s*(\\.name\\b|\\.toString\\b|\\+\\s*(''|""|\\[\\]))` +
+        `|(''|""|\\[\\])\\s*\\+\\s*${e}` +
+        `|String\\(\\s*${e}`
+      );
+      const tainted = new Set([...codeOf].filter(([, code]) => readerRe.test(code)).map(([n]) => n));
+      if (tainted.size === 0) return;
+
+      // 3. Propagate to callers until nothing changes.
+      const nameRes = new Map();
+      const mentions = (code, name) => {
+        if (!nameRes.has(name)) nameRes.set(name, new RegExp(`\\b${escapeRe(name)}\\b`));
+        return nameRes.get(name).test(code);
+      };
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const [name, code] of codeOf) {
+          if (tainted.has(name)) continue;
+          for (const tn of tainted) {
+            if (mentions(code, tn)) { tainted.add(name); grew = true; break; }
+          }
+        }
+      }
+
+      // 4. Zero-argument memoised getters (`f = function () { return v; }` inside f).
+      const isMemoised = (name, p) => {
+        let memo = false;
+        p.traverse({
+          AssignmentExpression(a) {
+            if (t.isIdentifier(a.node.left, { name }) && t.isFunction(a.node.right)) { memo = true; a.stop(); }
+          },
+        });
+        return memo;
+      };
+      const candidates = [...tainted].filter(
+        (n) => members.get(n).node.params.length === 0 && isMemoised(n, members.get(n))
+      );
+      if (candidates.length === 0) return;
+
+      // Evaluate against the original text. The sensor IIFE already has a
+      // primed context; nested functions get their own.
+      let ctx = fnName === sensorName ? sensorCtx : null;
+      if (!ctx) {
+        const original = findOriginal(fnName, fnPath.node.params.length);
+        if (!original) {
+          console.log(`[self_hash]   ${fnName}: original text not found, skipped`);
+          return;
+        }
+        try {
+          ctx = createFunctionContext(source, original);
+        } catch (err) {
+          console.log(`[self_hash]   ${fnName}: context failed (${err.message}), skipped`);
+          return;
+        }
+      }
+
+      for (const name of candidates) {
+        let value;
+        try {
+          value = vm.runInContext(`${name}()`, ctx, { timeout: 5000 });
+        } catch {
+          continue;
+        }
+        const primitive =
+          (typeof value === "number" && Number.isFinite(value)) ||
+          typeof value === "boolean" ||
+          (typeof value === "string" && value.length <= 64);
+        if (!primitive) continue;
+
+        const fn = members.get(name);
+        const ret = t.returnStatement(toLiteral(value));
+        t.addComment(ret, "leading", " source-hash key pinned to the value computed on the original build ", false);
+        fn.get("body").replaceWith(t.blockStatement([ret]));
+        pinned++;
+        console.log(`[self_hash]   ${fnName}: ${name}() → ${JSON.stringify(value)}`);
+      }
+    },
+  });
+  console.log(`[self_hash] done → ${pinned} key(s) pinned`);
 }
 
 function get_push_target(ast) {
@@ -879,11 +1203,20 @@ function deobfuscate(filePath) {
     const ctx = createObfuscatedContext(filePath);
     const st = get_push_target(ast);
     replace_functions_with_string(ast, replaced, ctx, st);
+    pin_self_hash_keys(ast, file, ctx);
 
   } catch (e) {
     console.log("[error] Invalid/Unsupported Akamai JS file.: ", e)
     return null;
   }
+
+  // Drop the raw source form of every string literal so the generator prints
+  // "apply" instead of the obfuscator's "\x61\x70\x70\x6c\x79".
+  traverse(ast, {
+    StringLiteral(path) {
+      if (path.node.extra) delete path.node.extra;
+    },
+  });
 
   return generate(ast).code;
 }

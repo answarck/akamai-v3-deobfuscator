@@ -20,14 +20,18 @@
 //      runtime failure cannot abort the rest of the setup.
 //   3. Installs forgiving browser/global stubs so setup code that touches
 //      window/document/navigator/etc. runs instead of throwing.
+//   4. Replays *verbatim source slices* (never Babel-regenerated code) and
+//      binds the sensor IIFE under its own name as a non-global. The decoder
+//      key offset (`Av()`) is derived from a hash of the IIFE's own
+//      `Function.prototype.toString()` and from `typeof window[<name>]`, so
+//      any reformatting, or a shim function under that name, silently yields
+//      a wrong offset and every decoded string comes out as garbage.
 
 import fs from "fs";
 import * as parser from "@babel/parser";
 import * as t from "@babel/types";
-import generator from "@babel/generator";
 import vm from "vm";
 
-const generate = generator.default;
 
 // Locate the main sensor IIFE and return its callee (the function node whose
 // body holds the string tables + decoders). Searches the AST rather than
@@ -96,22 +100,16 @@ function createPermissiveStub() {
 // Wrap a statement so a runtime failure during replay can't abort the rest of
 // the program. `var` bindings still hoist to context scope; only the
 // initialiser is guarded.
-function guard(stmt) {
-  return t.tryStatement(
-    t.blockStatement([stmt]),
-    t.catchClause(t.identifier("__ctxErr"), t.blockStatement([]))
-  );
+function guard(stmtSource) {
+  return `try {\n${stmtSource}\n} catch (__ctxErr) {}`;
 }
 
-function createObfuscatedContext(filePath) {
-  const source = fs.readFileSync(filePath, "utf-8");
-  const ast = parser.parse(source);
-
-  const sensorFn = findSensorFunction(ast);
-  if (!sensorFn) {
-    throw new Error("[context_setup] could not locate the sensor IIFE in " + filePath);
-  }
-
+// Build a VM context in which every top-level declaration of `fnNode` (a
+// function node parsed from `source`) is a callable global, with the
+// function's bootstrap (`return …`) executed so lazily-initialised state is
+// primed. Used for the sensor IIFE, and for any nested function that hashes
+// its own source (the embedded `QS` VM does).
+function createFunctionContext(source, fnNode) {
   const stub = createPermissiveStub();
   const sandbox = {
     // Common host globals the sensor probes during bootstrap. Anything not
@@ -133,9 +131,6 @@ function createObfuscatedContext(filePath) {
     atob: (s) => Buffer.from(String(s), "base64").toString("binary"),
     btoa: (s) => Buffer.from(String(s), "binary").toString("base64"),
   };
-  // The IIFE often references its own name internally (e.g.
-  // `R()[vP(bN)] = IFMXjkblQk`); expose a harmless shim so that doesn't throw.
-  if (sensorFn.id?.name) sandbox[sensorFn.id.name] = function () {};
   sandbox.globalThis = sandbox;
   sandbox.self = sandbox.window = sandbox;
 
@@ -146,19 +141,31 @@ function createObfuscatedContext(filePath) {
   // is only computed as a side effect of the IIFE's `return <bootstrap>` call —
   // so we must *run* that bootstrap, not drop it, or every decoder throws on
   // uninitialised state.
+  const slice = (node) => source.slice(node.start, node.end);
   const defs = [];
   const bootstraps = [];
-  for (const s of sensorFn.body.body) {
+  for (const s of fnNode.body.body) {
     if (t.isReturnStatement(s)) {
-      if (s.argument) bootstraps.push(s.argument);
+      if (s.argument) bootstraps.push(slice(s.argument));
       continue;
     }
-    defs.push(t.isFunctionDeclaration(s) ? s : guard(s));
+    defs.push(t.isFunctionDeclaration(s) ? slice(s) : guard(slice(s)));
+  }
+
+  // 0. The sensor keeps a reference to itself (`Ix()["E0"] = wVrtcwPkkm`) and
+  //    derives decoder constants from a hash of its own `toString()` and from
+  //    `typeof window[<name>]`. So the binding must (a) be the byte-exact
+  //    original function text, (b) carry the original name, and (c) NOT be a
+  //    property of the global object. A top-level `let` gives exactly that.
+  if (fnNode.id?.name) {
+    try {
+      vm.runInContext(`let ${fnNode.id.name} = ${slice(fnNode)};`, context, { timeout: 15000 });
+    } catch {}
   }
 
   // 1. Install every declaration as a context global (hoisting + order intact).
   try {
-    vm.runInContext(generate(t.program(defs)).code, context, { timeout: 15000 });
+    vm.runInContext(defs.join("\n"), context, { timeout: 15000 });
   } catch {
     // Hoisted declarations are already installed even if a later statement
     // aborts, so we can still proceed.
@@ -169,9 +176,8 @@ function createObfuscatedContext(filePath) {
   //    reaches genuinely browser-bound work, but by then the decode constants
   //    are already initialised. The timeout guards against headless hangs.
   for (const expr of bootstraps) {
-    const stmt = generate(t.expressionStatement(expr)).code;
     try {
-      vm.runInContext(stmt, context, { timeout: 10000 });
+      vm.runInContext(expr + ";", context, { timeout: 10000 });
     } catch {
       // Expected: bootstrap aborts at browser-bound work after priming state.
     }
@@ -180,4 +186,17 @@ function createObfuscatedContext(filePath) {
   return context;
 }
 
+function createObfuscatedContext(filePath) {
+  const source = fs.readFileSync(filePath, "utf-8");
+  const ast = parser.parse(source);
+
+  const sensorFn = findSensorFunction(ast);
+  if (!sensorFn) {
+    throw new Error("[context_setup] could not locate the sensor IIFE in " + filePath);
+  }
+
+  return createFunctionContext(source, sensorFn);
+}
+
+export { createFunctionContext, findSensorFunction };
 export default createObfuscatedContext;
