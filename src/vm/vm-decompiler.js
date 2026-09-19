@@ -1,5 +1,6 @@
 // =============================================================================
 // Akamai Sensor v3 "CS" VM decompiler
+// (integrated from the standalone akamai-vm-decompiler project)
 // -----------------------------------------------------------------------------
 // The sensor embeds small programs for a stack-based virtual machine. They are
 // invoked like:
@@ -24,8 +25,6 @@
 // out.js (the giant constant block around lines 1083-1201 and the opcode
 // handler bodies). See OPS for the per-opcode provenance.
 // =============================================================================
-
-'use strict';
 
 const MOD = 256; // qJ
 
@@ -135,7 +134,7 @@ for (const id in OPS) NAME2ID[OPS[id].name] = +id;
 // value). This is the invariant part of the VM — operand layout + how the
 // decompiler renders it. Opcode BYTE values differ per build and are supplied
 // separately via a "table" ({ qJ, ops: {OP: opidValue} }) so the same decompiler
-// works on any variant (see analyze-vm.cjs, which derives that table per file).
+// works on any variant (see analyze-vm.js, which derives that table per file).
 // -----------------------------------------------------------------------------
 const SEM = {};
 for (const id in OPS) { const o = OPS[id]; SEM[o.name] = { ops: o.ops, kind: o.kind, op: o.op }; }
@@ -599,34 +598,8 @@ function decompile(prog) {
   return [header, ...body].join('\n');
 }
 
-module.exports = {
+export {
   OPS, SEM, NAME2ID, MOD, DEFAULT_TABLE, Reader,
   decodeProgram, disassemble, formatDisassembly,
   analyze, decompileRegion, decompile,
 };
-
-// -----------------------------------------------------------------------------
-// CLI:  node src/vm-decompiler.cjs <base64> <magic> [--asm|--dec] [--from <file>]
-//   --from <file>  derive the opcode table from <file> (a dynamic variant);
-//                  without it the original reference build's table is assumed.
-// -----------------------------------------------------------------------------
-if (require.main === module) {
-  const args = process.argv.slice(2);
-  const mode = args.find(a => a === '--asm' || a === '--dec') || '--dec';
-  const fromIdx = args.indexOf('--from');
-  const fromFile = fromIdx !== -1 ? args[fromIdx + 1] : null;
-  const positional = args.filter((a, i) => !a.startsWith('--') && !(fromIdx !== -1 && i === fromIdx + 1));
-  const [b64, magicStr] = positional;
-  if (!b64 || magicStr === undefined) {
-    console.error('Usage: node src/vm-decompiler.cjs <base64> <magic> [--asm|--dec] [--from <file>]');
-    process.exit(1);
-  }
-  let table = DEFAULT_TABLE;
-  if (fromFile) {
-    const { deriveTable } = require('./analyze-vm.cjs');
-    table = deriveTable(require('fs').readFileSync(fromFile, 'utf8'));
-  }
-  const prog = decodeProgram(b64, parseInt(magicStr, 10), table);
-  if (mode === '--asm') console.log(formatDisassembly(prog, disassemble(prog)));
-  else console.log(decompile(prog));
-}

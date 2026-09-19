@@ -1,5 +1,6 @@
 // =============================================================================
-// analyze-vm.cjs — derive the CS-VM opcode table from a (deobfuscated) sensor
+// analyze-vm.js — derive the CS-VM opcode table from a (deobfuscated) sensor
+// (integrated from the standalone akamai-vm-decompiler project)
 // file by structural analysis, so the decompiler works on dynamic variants
 // where every identifier, constant value and opcode id has been re-randomised.
 //
@@ -13,37 +14,40 @@
 //   * every opcode handler, classified to a canonical operation, with its OPID
 //     numeric value read from the file's own constant block.
 //
-// Output feeds vm-decompiler.cjs: { qJ, ops: {OP: opidValue}, operands: {OP:[…]} }.
+// Output feeds vm-decompiler.js: { qJ, ops: {OP: opidValue}, operands: {OP:[…]} }.
 // =============================================================================
 
-'use strict';
+import * as parser from '@babel/parser';
+import traverseModule from '@babel/traverse';
+import vm from 'vm';
 
-const parser = require('@babel/parser');
-const traverseMod = require('@babel/traverse');
-const traverse = traverseMod.default || traverseMod;
-const vm = require('vm');
+const traverse = traverseModule.default;
 
 // ---------------------------------------------------------------------------
 // small AST helpers
 // ---------------------------------------------------------------------------
 const isThis = (n) => n && n.type === 'ThisExpression';
-// this[KEY]  ->  KEY (identifier name) or null
-function thisKey(n) {
-  if (n && n.type === 'MemberExpression' && isThis(n.object) && n.computed && n.property.type === 'Identifier') {
-    return n.property.name;
-  }
+// x[KEY] -> KEY as a string. The VM addresses its state through computed keys
+// that are identifiers in the raw build (`this[WF]`) and numeric literals once
+// the deobfuscator has inlined the constants (`this[116]`). Both spellings name
+// the same slot, so they are normalised to one string key.
+function computedKey(member) {
+  if (!member || member.type !== 'MemberExpression' || !member.computed) return null;
+  const p = member.property;
+  if (p.type === 'Identifier') return p.name;
+  if (p.type === 'NumericLiteral') return String(p.value);
   return null;
+}
+// this[KEY]  ->  KEY or null
+function thisKey(n) {
+  return n && n.type === 'MemberExpression' && isThis(n.object) ? computedKey(n) : null;
 }
 // callee of a CallExpression as a plain name, when it's an identifier
 const calleeName = (n) => (n && n.type === 'CallExpression' && n.callee.type === 'Identifier') ? n.callee.name : null;
 // X[KEY]()  ->  KEY   (instance method call; X is `this` or the local install var,
 // which both reference the VM instance — so don't require ThisExpression)
 function thisCallKey(n) {
-  if (n && n.type === 'CallExpression' && n.callee.type === 'MemberExpression' && n.callee.computed &&
-      n.callee.property.type === 'Identifier') {
-    return n.callee.property.name;
-  }
-  return null;
+  return n && n.type === 'CallExpression' ? computedKey(n.callee) : null;
 }
 function fnBody(fn) { return fn && (fn.type === 'FunctionExpression' || fn.type === 'FunctionDeclaration' || fn.type === 'ArrowFunctionExpression') ? fn.body : null; }
 
@@ -118,10 +122,10 @@ function collectMethodRoles(ast) {
   traverse(ast, {
     AssignmentExpression(p) {
       const { left, right } = p.node;
-      if (left.type !== 'MemberExpression' || !left.computed) return;
-      if (left.property.type !== 'Identifier') return;
+      const key = computedKey(left);
+      if (key === null) return;
       if (!(right.type === 'FunctionExpression' || right.type === 'ArrowFunctionExpression')) return;
-      installs.push({ key: left.property.name, fn: right });
+      installs.push({ key, fn: right });
     },
   });
 
@@ -216,11 +220,15 @@ function collectHandlers(ast) {
       // property must be  OBJ[ST](OPID)
       const prop = left.property;
       if (prop.type !== 'CallExpression') return;
-      if (prop.callee.type !== 'MemberExpression' || !prop.callee.computed) return;
-      if (prop.callee.property.type !== 'Identifier') return;
-      if (prop.arguments.length !== 1 || prop.arguments[0].type !== 'Identifier') return;
-      stKey = prop.callee.property.name;            // the sT method key
-      handlers.push({ opid: prop.arguments[0].name, fn: right });
+      const st = computedKey(prop.callee);
+      if (st === null) return;
+      // OPID is a constant: an identifier in the raw build, a numeric literal
+      // once the deobfuscator has inlined it.
+      if (prop.arguments.length !== 1) return;
+      const opid = prop.arguments[0];
+      if (opid.type !== 'Identifier' && opid.type !== 'NumericLiteral') return;
+      stKey = st;                                   // the sT method key
+      handlers.push({ opid: opid.type === 'Identifier' ? opid.name : opid.value, fn: right });
     },
   });
   return { handlers, stKey };
@@ -460,7 +468,7 @@ function deriveTable(src) {
   const { handlers, stKey } = collectHandlers(ast);
   const helperFnByName = indexFunctions(ast);
   // evaluate the constant block that actually defines the opcode ids (+ qJ)
-  const consts = evalConstantBlock(ast, handlers.map(h => h.opid));
+  const consts = evalConstantBlock(ast, handlers.map(h => h.opid).filter(o => typeof o === 'string'));
 
   // qJ: from the sT method  function(A){ return MOD(ADD(A, _), QJ) }
   let qJ = 256;
@@ -469,11 +477,9 @@ function deriveTable(src) {
     const body = fnBody(stInstall.fn);
     const ret = body && body.body.find(s => s.type === 'ReturnStatement');
     // ret.argument = MODHELPER( ADDHELPER(A, field), QJ )
-    if (ret && ret.argument && ret.argument.type === 'CallExpression' && ret.argument.arguments[1] &&
-        ret.argument.arguments[1].type === 'Identifier') {
-      const qjName = ret.argument.arguments[1].name;
-      if (consts[qjName] != null) qJ = consts[qjName];
-    }
+    const qjArg = ret && ret.argument && ret.argument.type === 'CallExpression' ? ret.argument.arguments[1] : null;
+    if (qjArg && qjArg.type === 'NumericLiteral') qJ = qjArg.value;
+    else if (qjArg && qjArg.type === 'Identifier' && consts[qjArg.name] != null) qJ = consts[qjArg.name];
   }
 
   const ctx = { ...roles, opHelpers, helperFnByName, stKey };
@@ -484,7 +490,7 @@ function deriveTable(src) {
   const collisions = [];
   for (const h of handlers) {
     const cls = classifyHandler(h.fn, ctx);
-    const opidVal = consts[h.opid];
+    const opidVal = typeof h.opid === 'number' ? h.opid : consts[h.opid];
     if (!cls || opidVal == null) { unresolved.push({ opid: h.opid, cls }); continue; }
     const byteVal = ((opidVal % qJ) + qJ) % qJ;
     all.push({ opid: h.opid, op: cls.op, value: byteVal });
@@ -496,24 +502,4 @@ function deriveTable(src) {
   return { qJ, ops, operands, unresolved, all, collisions, meta: { handlerCount: handlers.length, opHelpers, roles: roles.roleByKey, stackKey: roles.stackKey } };
 }
 
-module.exports = { deriveTable };
-
-// ---------------------------------------------------------------------------
-// debug CLI:  node src/analyze-vm.cjs <file>
-// ---------------------------------------------------------------------------
-if (require.main === module) {
-  const fs = require('fs');
-  const file = process.argv[2];
-  if (!file) { console.error('Usage: node src/analyze-vm.cjs <file>'); process.exit(1); }
-  const table = deriveTable(fs.readFileSync(file, 'utf8'));
-  console.log('qJ =', table.qJ);
-  console.log('handlers =', table.meta.handlerCount, ' resolved ops =', Object.keys(table.ops).length);
-  console.log('stackKey =', table.meta.stackKey);
-  console.log('\nOP -> opid(value)  operands');
-  for (const op of Object.keys(table.ops).sort()) {
-    console.log(`  ${op.padEnd(11)} ${String(table.ops[op]).padStart(3)}   [${table.operands[op].join(',')}]`);
-  }
-  if (table.unresolved.length) {
-    console.log('\nUNRESOLVED:', table.unresolved.map(u => u.opid + (u.cls ? '=' + u.cls.op : '')).join(', '));
-  }
-}
+export { deriveTable };
